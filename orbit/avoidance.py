@@ -1,20 +1,21 @@
+"""Human-readable conjunction response guidance."""
+
+
 def suggest_avoidance(alerts):
-    """
-    Generate simple avoidance strategies
-    """
     suggestions = []
+    for alert in alerts:
+        distance = alert["miss_distance_km"]
+        lead_minutes = alert["time_to_closest_s"] / 60.0
 
-    for a in alerts:
-        sat1, sat2, dist, step = a
-
-        # Simple rule-based logic
-        if dist < 20:
-            action = "🚨 Immediate maneuver: Increase altitude by +20 km"
-        elif dist < 50:
-            action = "⚠️ Adjust orbit: Increase altitude by +10 km"
+        if distance < 5:
+            action = "Urgent review: test prograde/retrograde along-track maneuver candidates."
+        elif distance < 20:
+            action = "Priority review: evaluate a small along-track burn and re-propagate both objects."
         else:
-            action = "ℹ️ Minor adjustment: Small inclination change"
+            action = "Monitor closely: evaluate maneuver candidates only if the screening risk persists."
 
-        suggestions.append((sat1, sat2, action))
+        if lead_minutes < 30:
+            action += " Lead time is short; avoid presenting the estimate as an executable command."
 
+        suggestions.append({**alert, "recommendation": action})
     return suggestions

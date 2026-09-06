@@ -1,49 +1,31 @@
+"""Small standalone 3D visualization example using the offline sample TLE."""
+from pathlib import Path
 
-import plotly.graph_objects as go
 import numpy as np
-from orbit.propagator import create_orbit, propagate_orbit
-from orbit.groundtrack import eci_to_latlon
+import plotly.graph_objects as go
 
-# Create orbit
-orbit = create_orbit(700)
+from orbit.propagator import propagate_orbit
+from orbit.tle_fetcher import _parse_three_line_tles
+from orbit.tle_loader import load_tle
 
-# Simulate
-times, positions = propagate_orbit(orbit, duration_hours=4, steps=500)
 
-# -------- 3D ORBIT --------
+sample_text = Path("orbit/sample_tles.txt").read_text(encoding="utf-8")
+name, tle1, tle2 = _parse_three_line_tles(sample_text, limit=1)[0]
+orbit = load_tle(tle1, tle2)
+_, positions = propagate_orbit(orbit, duration_hours=2, steps=180, start_time=orbit.epoch)
 
-fig_3d = go.Figure()
-
-# Satellite orbit line
-fig_3d.add_trace(go.Scatter3d(
-    x=positions[:, 0],
-    y=positions[:, 1],
-    z=positions[:, 2],
-    mode='lines',
-    line=dict(width=4),
-    name='Orbit'
+fig = go.Figure()
+fig.add_trace(go.Scatter3d(
+    x=positions[:, 0], y=positions[:, 1], z=positions[:, 2],
+    mode="lines", name=name,
 ))
 
-# Earth sphere
-theta = np.linspace(0, 2*np.pi, 50)
+radius_km = 6371.0
+theta = np.linspace(0, 2 * np.pi, 50)
 phi = np.linspace(0, np.pi, 50)
-
-R = 6371  # Earth radius (km)
-
-x = R * np.outer(np.cos(theta), np.sin(phi))
-y = R * np.outer(np.sin(theta), np.sin(phi))
-z = R * np.outer(np.ones(50), np.cos(phi))
-
-fig_3d.add_trace(go.Surface(
-    x=x, y=y, z=z,
-    opacity=0.4,
-    showscale=False,
-    name='Earth'
-))
-
-fig_3d.update_layout(
-    title="3D Orbit Around Earth",
-    scene=dict(aspectmode='data')
-)
-
-fig_3d.show()
+x = radius_km * np.outer(np.cos(theta), np.sin(phi))
+y = radius_km * np.outer(np.sin(theta), np.sin(phi))
+z = radius_km * np.outer(np.ones(50), np.cos(phi))
+fig.add_trace(go.Surface(x=x, y=y, z=z, opacity=0.4, showscale=False, name="Earth"))
+fig.update_layout(title=f"3D TLE Orbit — {name}", scene=dict(aspectmode="data"))
+fig.show()

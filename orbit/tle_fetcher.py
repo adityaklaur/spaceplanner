@@ -1,56 +1,80 @@
-
-import requests
+"""Fetch current TLE snapshots from CelesTrak with an offline fallback."""
+from pathlib import Path
+import os
 import time
 
-def fetch_multiple_tles():
-    url = "https://celestrak.org/NORAD/elements/active.txt"
+import requests
 
-    for attempt in range(3):  # 🔁 retry 3 times
+CELESTRAK_GP_URL = "https://celestrak.org/NORAD/elements/gp.php"
+_LAST_SOURCE = "Offline fallback"
+
+
+def _parse_three_line_tles(text: str, limit: int = 5):
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    satellites = []
+    i = 0
+    while i + 2 < len(lines) and len(satellites) < limit:
+        name, tle1, tle2 = lines[i], lines[i + 1], lines[i + 2]
+        if tle1.startswith("1 ") and tle2.startswith("2 "):
+            satellites.append((name, tle1, tle2))
+            i += 3
+        else:
+            # Be tolerant of unexpected headers instead of indexing blindly.
+            i += 1
+    return satellites
+
+
+def _offline_tles(limit: int = 5):
+    sample_path = Path(__file__).with_name("sample_tles.txt")
+    if not sample_path.exists():
+        raise RuntimeError("Offline TLE fallback file is missing")
+    satellites = _parse_three_line_tles(sample_path.read_text(encoding="utf-8"), limit)
+    if not satellites:
+        raise RuntimeError("Offline TLE fallback file contains no valid records")
+    return satellites
+
+
+def get_tle_source() -> str:
+    return _LAST_SOURCE
+
+
+def fetch_multiple_tles(limit: int = 5):
+    """Fetch a small current TLE set.
+
+    ``TLE_GROUP`` can be set on Railway to another CelesTrak group.  The
+    default ``weather`` group is deliberately compact and reliable for a demo.
+    """
+    global _LAST_SOURCE
+    if os.getenv("TLE_OFFLINE", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        satellites = _offline_tles(limit)
+        _LAST_SOURCE = "Offline sample TLEs"
+        print(f"Using {_LAST_SOURCE} ({len(satellites)} objects)")
+        return satellites
+
+    group = os.getenv("TLE_GROUP", "weather").strip() or "weather"
+    params = {"GROUP": group, "FORMAT": "tle"}
+    headers = {"User-Agent": "SpacePlanner/1.0 educational-orbit-dashboard"}
+
+    for attempt in range(2):
         try:
             response = requests.get(
-                url,
-                timeout=5,        # faster timeout
-                verify=False      # skip SSL delay
+                CELESTRAK_GP_URL,
+                params=params,
+                headers=headers,
+                timeout=6,
             )
+            response.raise_for_status()
+            satellites = _parse_three_line_tles(response.text, limit)
+            if satellites:
+                _LAST_SOURCE = f"CelesTrak / {group}"
+                print(f"Live TLE snapshot loaded: {_LAST_SOURCE} ({len(satellites)} objects)")
+                return satellites
+        except requests.RequestException as exc:
+            print(f"TLE fetch attempt {attempt + 1}/2 failed: {exc}")
+            if attempt < 1:
+                time.sleep(1.0)
 
-            if response.status_code == 200:
-                lines = response.text.strip().split("\n")
-
-                satellites = []
-                for i in range(0, min(len(lines), 30), 3):  # limit satellites
-                    name = lines[i].strip()
-                    tle1 = lines[i+1].strip()
-                    tle2 = lines[i+2].strip()
-                    satellites.append((name, tle1, tle2))
-
-                print("✅ Live TLE data loaded")
-                return satellites[:5]  # limit for performance
-
-        except Exception as e:
-            print(f"⚠️ Attempt {attempt+1} failed... retrying")
-            time.sleep(1)
-
-    # 🔴 FALLBACK
-    print("💾 Using offline data")
-
-    return [
-        ("ISS (ZARYA)",
-         "1 25544U 98067A   24067.54791435  .00016717  00000+0  10270-3 0  9993",
-         "2 25544  51.6436  21.4977 0007417  69.6797  42.8652 15.49815384435014"),
-
-        ("HUBBLE SPACE TELESCOPE",
-         "1 20580U 90037B   24067.53208918  .00000800  00000+0  38973-4 0  9991",
-         "2 20580  28.4694  87.1294 0002951  87.5643 272.5655 15.09204592391234"),
-
-        ("NOAA 15",
-         "1 25338U 98030A   24067.51782528  .00000091  00000+0  74605-4 0  9998",
-         "2 25338  98.7314  70.5982 0011643  90.5983 269.6413 14.25901522234567"),
-
-        ("TERRA",
-         "1 25994U 99068A   24067.50972847  .00000092  00000+0  65592-4 0  9996",
-         "2 25994  98.2051  65.2113 0001154  88.4532 271.6783 14.57109876543210"),
-
-        ("AQUA",
-         "1 27424U 02022A   24067.50000000  .00000089  00000+0  61234-4 0  9992",
-         "2 27424  98.1977  64.5123 0001200  85.1234 274.5678 14.57110000000000"),
-    ]
+    satellites = _offline_tles(limit)
+    _LAST_SOURCE = "Offline sample TLEs"
+    print(f"Using {_LAST_SOURCE} ({len(satellites)} objects)")
+    return satellites

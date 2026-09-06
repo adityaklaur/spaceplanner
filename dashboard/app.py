@@ -3,14 +3,14 @@ import shutil
 import numpy as np
 from dash import Dash, dcc, html, Input, Output
 import plotly.graph_objects as go
+from astropy.time import Time
 
 from orbit.propagator import propagate_orbit
 from orbit.groundtrack import eci_to_latlon
 from orbit.tle_loader import load_tle
-from orbit.tle_fetcher import fetch_multiple_tles
+from orbit.tle_fetcher import fetch_multiple_tles, get_tle_source
 from orbit.predict_collision import predict_collisions
-from orbit.avoidance import suggest_avoidance
-from orbit.optimizer import optimize_avoidance
+from ai.mission_planner import build_mission_plan
 
 # ── Clear stale Dash callback cache to prevent KeyError on restart ──
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -21,14 +21,28 @@ for _cache in ['.dash_cache']:
 
 app = Dash(
     __name__,
-    suppress_callback_exceptions=False,
+    suppress_callback_exceptions=True,
     update_title=None,
+    title="SpacePlanner Mission Control",
 )
 
-# TLE fetched once
-satellites = fetch_multiple_tles()
+# Current TLE snapshot fetched at application startup
+SATELLITE_LIMIT = max(2, min(15, int(os.getenv("SATELLITE_LIMIT", "5"))))
+satellites = fetch_multiple_tles(limit=SATELLITE_LIMIT)
+tle_source = get_tle_source()
+# Use one common epoch for every object so pairwise distances are time-aligned.
+# Current online TLEs are propagated from app startup; bundled demo TLEs use
+# the first sample TLE epoch to avoid pretending old fallback elements are current.
+if tle_source.startswith("Offline"):
+    SIMULATION_EPOCH = load_tle(satellites[0][1], satellites[0][2]).epoch
+else:
+    SIMULATION_EPOCH = Time.now().utc
 
-# Orbit cache
+COLLISION_THRESHOLD_KM = max(10.0, min(1000.0, float(os.getenv("COLLISION_THRESHOLD_KM", "50"))))
+PROPAGATION_STEPS = max(12, min(240, int(os.getenv("PROPAGATION_STEPS", "60"))))
+latest_alerts = []
+
+# Orbit cache is keyed by satellite + simulation duration.
 orbit_cache = {}
 
 # ─────────────────────────────────────────
@@ -39,7 +53,7 @@ app.index_string = '''
 <html>
 <head>
     {%metas%}
-    <title>Multi-Satellite Tracker</title>
+    <title>SpacePlanner Mission Control</title>
     {%favicon%}
     {%css%}
     <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
@@ -483,9 +497,9 @@ app.layout = html.Div(className='shell', children=[
             html.Div(className='topbar-right', children=[
                 html.Div(className='live-pill', children=[
                     html.Div(className='live-dot'),
-                    'LIVE'
+                    'SIMULATION'
                 ]),
-                html.Div('TLE Auto-Refresh', className='topbar-chip'),
+                html.Div(f'TLE: {tle_source}', className='topbar-chip'),
                 html.Div(id='sat-count-chip', className='topbar-chip'),
             ])
         ]),
@@ -518,6 +532,21 @@ def _dashboard_content():
                            },
                            tooltip={"placement": "bottom", "always_visible": False}),
             ]),
+            html.Div(className='card', children=[
+                html.Div('Screening Threshold', className='card-label'),
+                dcc.Slider(10, 1000, 10, value=COLLISION_THRESHOLD_KM, id='threshold',
+                           marks={
+                               10: {'label': '10', 'style': {'color': '#ffffff', 'fontWeight': '700'}},
+                               50: {'label': '50', 'style': {'color': '#ffffff', 'fontWeight': '700'}},
+                               250: {'label': '250', 'style': {'color': '#ffffff', 'fontWeight': '700'}},
+                               500: {'label': '500', 'style': {'color': '#ffffff', 'fontWeight': '700'}},
+                               1000: {'label': '1000 km', 'style': {'color': '#ffffff', 'fontWeight': '700'}},
+                           },
+                           tooltip={"placement": "bottom", "always_visible": False}),
+                html.Div('Educational closest-approach screening radius', style={
+                    'fontSize': '10px', 'color': 'var(--muted)', 'marginTop': '12px'
+                }),
+            ]),
             html.Div(id='alerts-panel', className='card alerts-card'),
         ]),
         html.Div(className='right-panel', children=[
@@ -525,7 +554,7 @@ def _dashboard_content():
                 html.Div(className='graph-card-header', children=[
                     html.Div(className='graph-card-title', children=[
                         '\U0001f30d Ground Track',
-                        html.Span('REAL-TIME', className='graph-card-badge')
+                        html.Span('TLE PROPAGATION', className='graph-card-badge')
                     ]),
                 ]),
                 dcc.Graph(id='map', config={'displayModeBar': False}, style={'height': '360px'}),
@@ -582,23 +611,44 @@ def _satellites_content():
 
 
 def _alerts_content():
-    try:
-        alerts = predict_collisions({})
-    except Exception:
-        alerts = []
-    return html.Div(style={'padding': '24px 28px'}, children=[
-        html.Div('Collision Alerts Log', style={
-            'fontSize': '10px', 'fontWeight': '600', 'letterSpacing': '1.2px',
-            'textTransform': 'uppercase', 'color': 'var(--muted)', 'marginBottom': '16px'
-        }),
-        html.Div(
-            '\u2705  System nominal \u2014 no collision risks logged. Data refreshes on Dashboard.',
+    if latest_alerts:
+        rows = []
+        for alert in latest_alerts[:20]:
+            rows.append(html.Div(style={
+                'padding': '14px 16px', 'borderRadius': '10px',
+                'background': 'var(--surface2)', 'border': '1px solid rgba(247,91,91,0.2)',
+                'marginBottom': '10px',
+            }, children=[
+                html.Div(f"{alert['sat1']}  ↔  {alert['sat2']}", style={
+                    'fontFamily': "'Space Mono', monospace", 'fontSize': '12px',
+                    'fontWeight': '700', 'color': 'var(--danger)'
+                }),
+                html.Div(
+                    f"{alert['risk_level']} · score {alert['risk_score']:.0f}/100 · "
+                    f"miss {alert['miss_distance_km']:.2f} km · "
+                    f"TCA {alert['time_to_closest_s']/60:.1f} min",
+                    style={'fontSize': '11px', 'color': 'var(--muted)', 'marginTop': '5px'}
+                ),
+            ]))
+        body = rows
+    else:
+        body = [html.Div(
+            '✅  No conjunctions are currently inside the screening threshold.',
             style={'fontSize': '13px', 'color': 'var(--safe)', 'padding': '16px',
                    'background': 'var(--surface2)', 'borderRadius': '10px',
                    'border': '1px solid var(--border)'}
-        ),
-        html.Div('Switch to Dashboard to see live collision detection.',
-                 style={'fontSize': '11px', 'color': 'var(--muted)', 'marginTop': '10px'})
+        )]
+
+    return html.Div(style={'padding': '24px 28px'}, children=[
+        html.Div('Conjunction Screening Log', style={
+            'fontSize': '10px', 'fontWeight': '600', 'letterSpacing': '1.2px',
+            'textTransform': 'uppercase', 'color': 'var(--muted)', 'marginBottom': '16px'
+        }),
+        *body,
+        html.Div(
+            'Screening output is educational decision support, not an operational collision probability.',
+            style={'fontSize': '11px', 'color': 'var(--muted)', 'marginTop': '10px'}
+        )
     ])
 
 
@@ -625,12 +675,14 @@ def _settings_content():
             'fontSize': '10px', 'fontWeight': '600', 'letterSpacing': '1.2px',
             'textTransform': 'uppercase', 'color': 'var(--muted)', 'marginBottom': '16px'
         }),
-        row('Update Interval', '4 seconds', 'Live position refresh rate'),
-        row('Orbit Propagation Steps', '60 steps', 'Per simulation window'),
-        row('TLE Data Source', 'CelesTrak', 'Offline fallback enabled'),
+        row('Animation Interval', '4 seconds', 'Moves through the propagated simulation window'),
+        row('Orbit Propagation Steps', f'{PROPAGATION_STEPS} steps', 'Per simulation window'),
+        row('TLE Data Source', tle_source, 'Offline fallback enabled'),
+        row('Simulation Epoch', SIMULATION_EPOCH.utc.iso, 'Common time origin for all propagated objects'),
         row('Satellites Loaded', str(len(sat_names)), ', '.join(sat_names[:3]) + ('...' if len(sat_names) > 3 else '')),
-        row('Avoidance Optimizer', 'Enabled', '\u0394v maneuver suggestions active'),
-        row('Collision Detection', 'Active', 'Real-time proximity monitoring'),
+        row('Autonomous Decision Layer', 'Enabled', 'Prioritises monitor / prepare / escalate states'),
+        row('Maneuver Screening', 'Enabled', 'Linearized Δv estimates for decision support'),
+        row('Conjunction Threshold', f'{COLLISION_THRESHOLD_KM:.0f} km', 'Closest-approach screening threshold'),
     ])
 
 
@@ -674,9 +726,10 @@ def switch_page(n_dash, n_sat, n_alert, n_set):
     Output('sidebar-status', 'children'),
     Output('sat-count-chip', 'children'),
     Input('duration', 'value'),
+    Input('threshold', 'value'),
     Input('interval', 'n_intervals')
 )
-def update(duration, n_intervals):
+def update(duration, threshold, n_intervals):
 
     fig_map = go.Figure()
     fig_3d  = go.Figure()
@@ -783,7 +836,7 @@ def update(duration, n_intervals):
     for pole_lat in [90, -90]:
         px, py, pz = latlon_to_xyz(pole_lat, 0)
         fig_3d.add_trace(go.Scatter3d(
-            x=[px], y=[py], z=[pz], mode='markers',
+            x=px, y=py, z=pz, mode='markers',
             marker=dict(size=4, color='rgba(220,240,255,0.6)'),
             hoverinfo='skip', showlegend=False, name=''
         ))
@@ -794,13 +847,17 @@ def update(duration, n_intervals):
     # ── Satellite loop ──
     for i, (name, tle1, tle2) in enumerate(satellites):
         try:
-            if name not in orbit_cache:
+            cache_key = (name, float(duration), PROPAGATION_STEPS)
+            if cache_key not in orbit_cache:
                 orbit = load_tle(tle1, tle2)
-                times, positions = propagate_orbit(orbit, duration_hours=duration, steps=60)
-                epoch = orbit.epoch
-                orbit_cache[name] = (times, positions, epoch)
+                times, positions = propagate_orbit(
+                    orbit, duration_hours=duration, steps=PROPAGATION_STEPS,
+                    start_time=SIMULATION_EPOCH,
+                )
+                epoch = SIMULATION_EPOCH
+                orbit_cache[cache_key] = (times, positions, epoch)
             else:
-                times, positions, epoch = orbit_cache[name]
+                times, positions, epoch = orbit_cache[cache_key]
 
             lats, lons = eci_to_latlon(positions, times, epoch)
             idx = n_intervals % len(positions)
@@ -820,7 +877,7 @@ def update(duration, n_intervals):
                 name=name,
                 opacity=0.6
             ))
-            # MAP — current position
+            # MAP — simulated position within the propagation window
             fig_map.add_trace(go.Scattergeo(
                 lat=[lats[idx]], lon=[lons[idx]],
                 mode='markers+text',
@@ -831,7 +888,7 @@ def update(duration, n_intervals):
                     size=10, color=color,
                     line=dict(width=2, color='white')
                 ),
-                name=f"{name} (Now)"
+                name=f"{name} (Sim)"
             ))
 
             # 3D orbit
@@ -851,16 +908,25 @@ def update(duration, n_intervals):
                     size=7, color=color,
                     line=dict(width=1, color='white')
                 ),
-                name=f"{name} (Now)"
+                name=f"{name} (Sim)"
             ))
 
         except Exception as e:
             print(f"❌ Skipping {name}: {e}")
 
-    # ── Collision prediction ──
-    alerts      = predict_collisions(sat_positions)
-    suggestions = suggest_avoidance(alerts)
-    optimized   = optimize_avoidance(alerts, sat_positions)
+    # ── Conjunction screening ──
+    global latest_alerts
+    time_step_seconds = (float(duration) * 3600.0) / max(PROPAGATION_STEPS - 1, 1)
+    alerts = predict_collisions(
+        sat_positions,
+        threshold_km=float(threshold),
+        time_step_seconds=time_step_seconds,
+    )
+    mission_plan = build_mission_plan(
+        alerts,
+        target_miss_distance_km=max(75.0, float(threshold) * 1.5),
+    )
+    latest_alerts = mission_plan
 
     # ── Build alerts panel ──
     alerts_panel_children = []
@@ -873,44 +939,58 @@ def update(duration, n_intervals):
         alert_banner_children = [
             html.Span('⚠️', className='alert-icon'),
             html.Div([
-                html.Div('Collision Risk Detected!', className='alert-text-title'),
-                html.Div('Immediate action required', className='alert-text-sub'),
+                html.Div('Conjunction Screening Alert', className='alert-text-title'),
+                html.Div('Review closest-approach and maneuver screening estimates', className='alert-text-sub'),
             ])
         ]
 
         alerts_panel_children.append(
-            html.Div('⚠ Collision Alerts', className='card-label',
+            html.Div('⚠ Conjunction Alerts', className='card-label',
                      style={'color': '#f75b5b'})
         )
 
-        for i, a in enumerate(alerts):
-            sat1, sat2, dist, step = a
-            time_min   = step * (duration * 3600 / 60) / 60
-            rule_action = suggestions[i][2]
-            dv          = optimized[i][2]
-            opt_action  = optimized[i][3]
+        for alert in mission_plan:
+            sat1 = alert['sat1']
+            sat2 = alert['sat2']
+            dist = alert['miss_distance_km']
+            time_min = alert['time_to_closest_s'] / 60.0
+            rule_action = alert['recommendation']
+            dv = alert['estimated_delta_v_m_s']
+            opt_action = alert['maneuver_guidance']
 
             alerts_panel_children.append(html.Div(className='alert-item', children=[
                 html.Div(className='alert-item-header', children=[
                     '⚡ ', f'{sat1}  ↔  {sat2}'
                 ]),
                 html.Div(className='alert-item-row', children=[
-                    html.Span('Distance'),
+                    html.Span('Risk'),
+                    html.Span(f"{alert['risk_level']} · {alert['risk_score']:.0f}/100")
+                ]),
+                html.Div(className='alert-item-row', children=[
+                    html.Span('Decision'),
+                    html.Span(f"{alert['priority']} · {alert['decision']}")
+                ]),
+                html.Div(className='alert-item-row', children=[
+                    html.Span('Closest approach'),
                     html.Span(f'{dist:.2f} km')
                 ]),
                 html.Div(className='alert-item-row', children=[
                     html.Span('Time to closest'),
                     html.Span(f'~{time_min:.1f} min')
                 ]),
+                html.Div(className='alert-item-row', children=[
+                    html.Span('Relative speed'),
+                    html.Span(f"{alert['relative_speed_km_s']:.2f} km/s")
+                ]),
                 html.Div(html.B(rule_action),
                          style={'fontSize': '11px', 'color': '#f7a843', 'marginTop': '6px'}),
-                html.Div(f'Δv  {dv:.2f} m/s', className='dv-chip'),
+                html.Div(f'Estimated Δv  {dv:.2f} m/s', className='dv-chip'),
                 html.Div(opt_action, className='maneuver-text'),
             ]))
 
         sidebar_status = [
             html.Div('System Status', className='status-badge-label'),
-            html.Div(f'⚠ {len(alerts)} Collision Risk{"s" if len(alerts)>1 else ""}',
+            html.Div(f'⚠ {len(alerts)} Conjunction Alert{"s" if len(alerts)>1 else ""}',
                      className='status-badge-value bad')
         ]
 
@@ -920,14 +1000,14 @@ def update(duration, n_intervals):
         alert_banner_children = [
             html.Span('✅', className='alert-icon'),
             html.Div([
-                html.Div('All Clear — No Collision Risk', className='alert-text-title'),
-                html.Div('Satellites operating nominally', className='alert-text-sub'),
+                html.Div('All Clear — No Threshold Conjunction', className='alert-text-title'),
+                html.Div('No pair falls inside the current screening threshold', className='alert-text-sub'),
             ])
         ]
         alerts_panel_children = [
             html.Div('Status', className='card-label'),
             html.Div(
-                '✅  No collision risk detected',
+                '✅  No threshold conjunction detected',
                 style={'fontSize': '13px', 'color': '#43e89b', 'fontWeight': '500',
                        'padding': '8px 0'}
             ),
@@ -1004,5 +1084,17 @@ def update(duration, n_intervals):
 # ─────────────────────────────────────────
 server = app.server
 
+
+@server.get('/health')
+def health():
+    return {
+        'status': 'ok',
+        'service': 'spaceplanner',
+        'satellites_loaded': len(satellites),
+        'tle_source': tle_source,
+    }, 200
+
+
 if __name__ == '__main__':
-    app.run(debug=False)
+    port = int(os.getenv('PORT', '8050'))
+    app.run(host='0.0.0.0', port=port, debug=False)

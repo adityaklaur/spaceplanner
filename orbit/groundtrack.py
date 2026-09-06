@@ -1,33 +1,40 @@
+"""Coordinate conversion helpers for ground-track display."""
 import numpy as np
 from astropy import units as u
-from astropy.coordinates import GCRS, ITRS, CartesianRepresentation
+from astropy.coordinates import CartesianRepresentation, ITRS, TEME
+from astropy.time import Time
+from astropy.utils import iers
+
+# Railway/CI should not block while Astropy tries to download fresh IERS data.
+iers.conf.auto_download = False
 
 
 def eci_to_latlon(positions_km, times, epoch):
+    """Convert SGP4 TEME positions to geodetic latitude/longitude.
+
+    Parameters
+    ----------
+    positions_km : array-like, shape (N, 3)
+        TEME coordinates in kilometres.
+    times : array-like
+        Seconds from ``epoch``.
+    epoch : astropy.time.Time
+        TLE epoch.
     """
-    Convert ECI coordinates to latitude & longitude
-    """
+    positions = np.asarray(positions_km, dtype=float)
+    seconds = np.asarray(times, dtype=float)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("positions_km must have shape (N, 3)")
+    if len(positions) != len(seconds):
+        raise ValueError("positions and times must have equal length")
 
-    lats = []
-    lons = []
-
-    for i, pos in enumerate(positions_km):
-        t = epoch + times[i] * u.s
-
-        # Create space coordinate
-        gcrs = GCRS(
-            CartesianRepresentation(pos[0] * u.km,
-                                    pos[1] * u.km,
-                                    pos[2] * u.km),
-            obstime=t
-        )
-
-        # Convert to Earth-fixed frame
-        itrs = gcrs.transform_to(ITRS(obstime=t))
-
-        # Get lat/lon
-        location = itrs.earth_location
-        lats.append(location.lat.deg)
-        lons.append(location.lon.deg)
-
-    return np.array(lats), np.array(lons)
+    obstimes = Time(epoch) + seconds * u.s
+    cart = CartesianRepresentation(
+        x=positions[:, 0] * u.km,
+        y=positions[:, 1] * u.km,
+        z=positions[:, 2] * u.km,
+    )
+    teme = TEME(cart, obstime=obstimes)
+    itrs = teme.transform_to(ITRS(obstime=obstimes))
+    geodetic = itrs.earth_location.geodetic
+    return np.asarray(geodetic.lat.deg), np.asarray(geodetic.lon.deg)

@@ -1,7 +1,12 @@
-from orbit.tle_fetcher import fetch_iss_tle
+"""Local development entry point.
 
-tle1, tle2 = fetch_iss_tle()
+Production deployments use Gunicorn (see Dockerfile).
+"""
+import os
 
-print("Live ISS TLE:")
-print(tle1)
-print(tle2)
+from dashboard.app import app
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8050"))
+    app.run(host="0.0.0.0", port=port, debug=False)

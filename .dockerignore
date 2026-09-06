@@ -1,9 +1,10 @@
-.venv/
-venv/
+.git
+.gitignore
 __pycache__/
 *.py[cod]
-.env
+*.log
+.venv/
+venv/
 .DS_Store
 .pytest_cache/
 .mypy_cache/
-*.log

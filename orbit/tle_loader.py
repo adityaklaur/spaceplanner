@@ -1,50 +1,29 @@
-from poliastro.bodies import Earth
-from poliastro.twobody import Orbit
-from astropy import units as u
-from sgp4.api import Satrec, jday
-from datetime import datetime
+"""TLE loading utilities backed directly by SGP4.
+
+Poliastro is intentionally not used here.  SGP4 is the standard propagation
+model for TLEs, and using it directly keeps the runtime small and avoids the
+Python-version constraints of the archived poliastro package.
+"""
+from dataclasses import dataclass
+
 from astropy.time import Time
+from sgp4.api import Satrec
 
 
-def load_tle(tle_line1, tle_line2):
-    """
-    Convert TLE → Poliastro Orbit object
-    """
+@dataclass(frozen=True)
+class TLEOrbit:
+    """Small wrapper around an SGP4 satellite and its TLE epoch."""
 
-    # Create satellite from TLE
-    satellite = Satrec.twoline2rv(tle_line1, tle_line2)
+    satellite: Satrec
+    epoch: Time
 
-    # Current UTC time
-    now = datetime.utcnow()
 
-    # Convert to Julian date
-    jd, fr = jday(
-        now.year,
-        now.month,
-        now.day,
-        now.hour,
-        now.minute,
-        now.second
-    )
+def load_tle(tle_line1: str, tle_line2: str) -> TLEOrbit:
+    """Parse two TLE lines and return an SGP4 orbit wrapper."""
+    if not tle_line1.startswith("1 ") or not tle_line2.startswith("2 "):
+        raise ValueError("Invalid TLE: expected line 1 and line 2 records")
 
-    # Propagate using SGP4
-    error_code, position, velocity = satellite.sgp4(jd, fr)
-
-    if error_code != 0:
-        raise Exception(f"SGP4 error code: {error_code}")
-
-    # Convert position & velocity to astropy units
-    import numpy as np
-
-    r = np.array(position) * u.km
-    v = np.array(velocity) * u.km / u.s
-
-    # Create orbit (IMPORTANT FIX HERE)
-    orbit = Orbit.from_vectors(
-        Earth,
-        r,
-        v,
-        epoch=Time(now)
-    )
-
-    return orbit
+    satellite = Satrec.twoline2rv(tle_line1.strip(), tle_line2.strip())
+    epoch_jd = satellite.jdsatepoch + satellite.jdsatepochF
+    epoch = Time(epoch_jd, format="jd", scale="utc")
+    return TLEOrbit(satellite=satellite, epoch=epoch)

@@ -1,41 +1,32 @@
-import numpy as np
+"""First-order maneuver screening estimates.
 
-def compute_delta_v(pos1, pos2):
-    """
-    Approximate Δv needed to separate two satellites
-    """
-    distance = np.linalg.norm(pos1 - pos2)
-
-    # Simple model: closer = higher Δv required
-    if distance == 0:
-        return 0
-
-    dv = 1 / distance * 1000   # scaled for visibility
-
-    return dv
+This module intentionally does not claim to solve a high-fidelity optimal-control
+problem.  It provides a transparent linearized delta-v estimate that is useful
+for ranking candidate responses in the educational dashboard.
+"""
 
 
-def optimize_avoidance(alerts, sat_positions):
-    """
-    Generate optimized avoidance strategy
-    """
-    optimized = []
+def estimate_delta_v(alert, target_miss_distance_km=75.0, minimum_lead_time_s=900.0):
+    extra_separation_km = max(0.0, float(target_miss_distance_km) - float(alert["miss_distance_km"]))
+    effective_time_s = max(float(alert["time_to_closest_s"]), float(minimum_lead_time_s))
+    return extra_separation_km * 1000.0 / effective_time_s
 
-    for a in alerts:
-        sat1, sat2, dist, step = a
 
-        pos1 = sat_positions[sat1][step]
-        pos2 = sat_positions[sat2][step]
-
-        dv = compute_delta_v(pos1, pos2)
-
-        if dv < 5:
-            action = "🟢 Minor thrust adjustment"
-        elif dv < 20:
-            action = "🟡 Moderate burn required"
+def optimize_avoidance(alerts, sat_positions=None, target_miss_distance_km=75.0):
+    estimates = []
+    for alert in alerts:
+        dv = estimate_delta_v(alert, target_miss_distance_km=target_miss_distance_km)
+        if dv < 0.5:
+            action = "Low screening Δv — evaluate minor along-track correction"
+        elif dv < 2.0:
+            action = "Moderate screening Δv — compare prograde and retrograde candidates"
         else:
-            action = "🔴 High fuel maneuver needed"
+            action = "High screening Δv — escalate for higher-fidelity maneuver planning"
 
-        optimized.append((sat1, sat2, dv, action))
-
-    return optimized
+        estimates.append({
+            **alert,
+            "estimated_delta_v_m_s": dv,
+            "target_miss_distance_km": float(target_miss_distance_km),
+            "maneuver_guidance": action,
+        })
+    return estimates
